@@ -4,12 +4,13 @@ from itertools import chain
 
 import torch
 from torch import nn as nn
+from torch.nn import init
 
 from utils.util import *
 
 
 class AlexNetCaffe(nn.Module):
-    def __init__(self, n_classes=100, dropout=True):
+    def __init__(self, n_classes=100, dropout=True, classify=True):
         super(AlexNetCaffe, self).__init__()
         print("Using Caffe AlexNet")
         self.features = nn.Sequential(OrderedDict([
@@ -37,47 +38,41 @@ class AlexNetCaffe(nn.Module):
             ("relu7", nn.ReLU(inplace=True)),
             ("drop7", nn.Dropout())]))
 
+        self.header = nn.Linear(4096, 512)
+
+
         self.classifier_l = nn.Linear(512, n_classes)
-        self.p_logvar = nn.Sequential(nn.Linear(4096, 512),
-                                      nn.ReLU())
-        self.p_mu = nn.Sequential(nn.Linear(4096, 512),
-                                  nn.LeakyReLU())
+        init.normal_(self.header.weight, mean=0.0, std=0.1)
+        init.normal_(self.classifier_l.weight, mean=0.0, std=0.1)
 
     def get_params(self, base_lr):
         return [{"params": self.features.parameters(), "lr": 0.},
-                {"params": chain(self.classifier.parameters(), self.classifier_l.parameters(), self.p_logvar.parameters(), self.p_mu.parameters()
+                {"params": chain(self.classifier.parameters(), self.classifier_l.parameters(),
+                                 self.p_logvar.parameters(), self.p_mu.parameters()
                                  ), "lr": base_lr}]
 
     def is_patch_based(self):
         return False
 
-    def forward(self, x, train=True):
-        end_points={}
-        x = self.features(x*57.6)  #57.6 is the magic number needed to bring torch data back to the range of caffe data, based on used std
+    def forward(self, x, classify=False,train=True, **kwargs):
+        if classify:
+            return self.classifier_l(x)
+        end_points = {}
+        x = self.features(
+            x * 57.6)  # 57.6 is the magic number needed to bring torch data back to the range of caffe data, based on used std
         x = x.view(x.size(0), -1)
         x = self.classifier(x)
-
-        logvar = self.p_logvar(x)
-        mu = self.p_mu(x)
-        end_points['logvar'] = logvar
-        end_points['mu'] = mu
-
-        if train:
-            x = reparametrize(mu, logvar)
-        else:
-            x = mu
-
+        x = self.header(x)
         end_points['Embedding'] = x
         x = self.classifier_l(x)
         end_points['Predictions'] = nn.functional.softmax(input=x, dim=-1)
-
-
         return x, end_points
 
 
 class Flatten(nn.Module):
     def forward(self, x):
         return x.view(x.size(0), -1)
+
 
 def caffenet(classes):
     model = AlexNetCaffe(classes)
@@ -147,7 +142,6 @@ def caffenet(classes):
 #                 nn.init.constant_(m.bias, 0)
 
 
-
 # class AlexNetCaffeFC7(AlexNetCaffe):
 #     def __init__(self, jigsaw_classes=1000, n_classes=100, dropout=True):
 #         super(AlexNetCaffeFC7, self).__init__()
@@ -184,9 +178,6 @@ def caffenet(classes):
 #             ("relu7", nn.ReLU(inplace=True)),
 #             ("drop7", nn.Dropout()),
 #             ("fc8", nn.Linear(4096, n_classes))]))
-
-
-
 
 
 # def caffenet_gap(jigsaw_classes, classes):

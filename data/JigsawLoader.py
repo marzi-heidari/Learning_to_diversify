@@ -166,15 +166,17 @@ class JigsawTestDatasetMultiple(JigsawDataset):
 
 
 class JigsawNewDataset(data.Dataset):
-    def __init__(self, args, names, labels, jig_classes=100, img_transformer=None, tile_transformer=None, patches=True,
+    def __init__(self, args, names, labels, img_transformer=None, tile_transformer=None, patches=True,
                  bias_whole_image=None):
         self.task = args.task
         if self.task == 'PACS':
-            self.data_path = "/home/data1/PACS/kfold"
+            self.data_path = "../../data/PACS/pacs_data/pacs_data"
         elif self.task == 'VLCS':
             self.data_path = "/home/data1/VLCS"
         elif self.task == 'HOME':
             self.data_path = ""
+        elif self.task == 'digits':
+            self.data_path = "/home/marzi/data/"
         else:
             raise NotImplementedError
         self.names = names
