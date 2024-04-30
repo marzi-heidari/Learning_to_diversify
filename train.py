@@ -4,16 +4,21 @@ import os
 import torch.autograd
 from torch import nn, optim
 from torch.autograd import Variable
+from torch.optim import lr_scheduler
 from torchvision import transforms
+from tqdm import tqdm
 
 from data import data_helper
+from data.data_gen_MNIST import adam
 from data.data_helper import available_datasets
 from models import model_factory
 from models.caffenet import caffenet
+from models.lenet import LeNet5
 from models.resnet import resnet18
 from utils.Logger import Logger
 from utils.contrastive_loss import SupConLoss
 from utils.util import *
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Script to launch jigsaw training",
@@ -36,14 +41,15 @@ def get_args():
     parser.add_argument("--limit_target", default=None, type=int,
                         help="If set, it will limit the number of testing samples")
     parser.add_argument("--learning_rate", "-l", type=float, default=.01, help="Learning rate")
-    parser.add_argument("--epochs", "-e", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--epochs", "-e", type=int, default=10001, help="Number of epochs")
     parser.add_argument("--seen_index", "-s", type=int, default=0, help="Number of epochs")
     parser.add_argument("--network", choices=model_factory.nets_map.keys(), help="Which network to use",
                         default="resnet18")
     parser.add_argument("--aug_number", type=int, default=0, help="")
     parser.add_argument("--aug", type=str, default="", help="")
     parser.add_argument("--tf_logger", type=bool, default=True, help="If true will save tensorboard compatible logs")
-    parser.add_argument("--imbalanced_class", type=bool, default=False, help="If true will save tensorboard compatible logs")
+    parser.add_argument("--imbalanced_class", type=bool, default=False,
+                        help="If true will save tensorboard compatible logs")
     parser.add_argument("--val_size", type=float, default="0.1", help="Validation size (between 0 and 1)")
     parser.add_argument("--folder_name", default='test', help="Used by the logger to save logs")
     parser.add_argument("--bias_whole_image", default=0.9, type=float,
@@ -51,7 +57,7 @@ def get_args():
     parser.add_argument("--TTA", type=bool, default=False, help="Activate test time data augmentation")
     parser.add_argument("--classify_only_sane", default=False, type=bool,
                         help="If true, the network will only try to classify the non scrambled images")
-    parser.add_argument("--loops_min", type=int, default=100, help="")
+    parser.add_argument("--loops_min", type=int, default=200, help="")
     parser.add_argument("--train_all", default=True, type=bool, help="If true, all network weights will be trained")
     parser.add_argument("--suffix", default="", help="Suffix for the logger")
     parser.add_argument("--nesterov", default=False, type=bool, help="Use nesterov")
@@ -107,7 +113,7 @@ class MixupGenerator(nn.Module):
         )
 
         # Linear transformations for Q, K, V
-        self.W_Q = nn.Linear(feat_size, feat_size*3, bias=False)
+        self.W_Q = nn.Linear(feat_size, feat_size * 3, bias=False)
         self.W_K = nn.Linear(feat_size, feat_size, bias=False)
         self.W_V = nn.Linear(feat_size, feat_size, bias=False)
         self.sqrt_d = torch.sqrt(torch.tensor(feat_size, dtype=torch.float32))
@@ -215,22 +221,38 @@ class Trainer:
         self.device = device
         self.counterk = 0
         self.k = 5
+        if args.task == 'digits':
+            dim = 1024
+        elif args.task == 'PACS':
+            dim = 512
 
-        self.mixup_generator = MixupGenerator(self.k, self.k * 2, self.k, 512, args.n_classes).cuda(self.args.gpu)
+        self.mixup_generator = MixupGenerator(self.k, self.k * 2, self.k, dim, args.n_classes).cuda(self.args.gpu)
 
-        self.discriminator = SimpleDiscriminator(512).cuda(self.args.gpu)
-        self.mixup_generator_optimizer = torch.optim.SGD(self.mixup_generator.parameters(), lr=0.01, weight_decay=1e-3,
-                                                         momentum=0.9,
-                                                         nesterov=True, )
-        self.discriminator_optimizer = torch.optim.SGD(self.discriminator.parameters(), lr=0.01, weight_decay=1e-3,
-                                                       momentum=0.9,
-                                                       nesterov=False, )
+        self.discriminator = SimpleDiscriminator(dim).cuda(self.args.gpu)
+        if args.task == 'digits':
+            self.mixup_generator_optimizer = torch.optim.Adam(self.mixup_generator.parameters(), lr=0.0001,
+                                                              weight_decay=1e-3)
+        else:
+            self.mixup_generator_optimizer = torch.optim.SGD(self.mixup_generator.parameters(), lr=0.001,
+                                                             weight_decay=1e-3,
+                                                             momentum=0.9,
+                                                             nesterov=True, )
+        if args.task == 'digits':
+            self.discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=0.0001,
+                                                            weight_decay=1e-3)
+        else:
+            self.discriminator_optimizer = torch.optim.SGD(self.discriminator.parameters(), lr=0.001, weight_decay=1e-3,
+                                                           momentum=0.9,
+                                                           nesterov=True, )
         self.discriminator.train()
         self.mixup_generator.train()
 
         # Caffe Alexnet for singleDG task, Leave-one-out PACS DG task.
         # self.extractor = caffenet(args.n_classes).to(device)
-        self.extractor = resnet18(classes=args.n_classes, c_dim=512).to(device)
+        if args.task == 'PACS':
+            self.extractor = resnet18(classes=args.n_classes, c_dim=512).to(device)
+        elif args.task == 'digits':
+            self.extractor = LeNet5(num_classes=args.n_classes).to(device)
 
         self.source_loader, self.val_loader = data_helper.get_train_dataloader(args, patches=False)
         if len(self.args.target) > 1:
@@ -248,10 +270,22 @@ class Trainer:
 
         parameter_list.append({'params': self.extractor.class_classifier.parameters(), 'lr': self.args.learning_rate})
         # Get optimizers and Schedulers, self.discriminator
-        self.optimizer = torch.optim.SGD(parameter_list, momentum=0.9,
-                                         nesterov=True, weight_decay=0.00005)
+        if args.task == 'PACS':
+            self.optimizer = torch.optim.SGD(parameter_list, momentum=0.9,
+                                             nesterov=True, weight_decay=0.00005)
+        elif args.task == 'digits':
+            self.optimizer = adam(
+                parameters=self.extractor.parameters(),
+                lr=1e-4,
+                weight_decay=0,
+            )
 
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.args.epochs)
+        if args.task == 'PACS':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, self.args.epochs)
+        elif args.task == 'digits':
+            self.scheduler = lr_scheduler.StepLR(
+                optimizer=self.optimizer, step_size=10001, gamma=0.1
+            )
         self.scheduler2 = optim.lr_scheduler.CosineAnnealingLR(self.mixup_generator_optimizer, self.args.epochs)
         self.scheduler3 = optim.lr_scheduler.CosineAnnealingLR(self.discriminator_optimizer, self.args.epochs)
 
@@ -398,41 +432,41 @@ class Trainer:
             # mixup_data, mixup_label, lam = self.mixup_one_target(data, y_lb, alpha=0.75, is_bias=True)
             # logits, touple = self.extractor(mixup_data)
             # mixup_loss = F.cross_entropy(logits, mixup_label.type(torch.LongTensor).to(self.device), reduction='mean')
-            loss = (sup_loss + 0.5* loss_aug_main)
+            loss = (sup_loss + 0.5 * loss_aug_main)
 
             loss.backward()
             self.optimizer.step()
 
         del loss, logits
+        if epoch % 50 == 0:
+            self.extractor.eval()
+            with torch.no_grad():
 
-        self.extractor.eval()
-        with torch.no_grad():
+                if len(self.args.target) > 1:
+                    avg_acc = 0
+                    for i, loader in enumerate(self.target_loader):
+                        total = len(loader.dataset)
 
-            if len(self.args.target) > 1:
-                avg_acc = 0
-                for i, loader in enumerate(self.target_loader):
-                    total = len(loader.dataset)
+                        class_correct = self.do_test(loader)
 
-                    class_correct = self.do_test(loader)
+                        class_acc = float(class_correct) / total
+                        self.logger.log_test('test', {"class": class_acc})
 
-                    class_acc = float(class_correct) / total
-                    self.logger.log_test('test', {"class": class_acc})
+                        avg_acc += class_acc
+                    avg_acc = avg_acc / len(self.args.target)
+                    print(avg_acc)
+                    self.results["test"][self.current_epoch] = avg_acc
+                else:
+                    for phase, loader in self.test_loaders.items():
+                        if self.args.task == 'HOME' and phase == 'val':
+                            continue
+                        total = len(loader.dataset)
 
-                    avg_acc += class_acc
-                avg_acc = avg_acc / len(self.args.target)
-                print(avg_acc)
-                self.results["test"][self.current_epoch] = avg_acc
-            else:
-                for phase, loader in self.test_loaders.items():
-                    if self.args.task == 'HOME' and phase == 'val':
-                        continue
-                    total = len(loader.dataset)
+                        class_correct = self.do_test(loader)
 
-                    class_correct = self.do_test(loader)
-
-                    class_acc = float(class_correct) / total
-                    self.logger.log_test(phase, {"class": class_acc})
-                    self.results[phase][self.current_epoch] = class_acc
+                        class_acc = float(class_correct) / total
+                        self.logger.log_test(phase, {"class": class_acc})
+                        self.results[phase][self.current_epoch] = class_acc
 
     @torch.no_grad()
     def mixup_one_target(self, x, y, alpha=1.0, is_bias=False):
@@ -464,15 +498,16 @@ class Trainer:
 
         return class_correct
 
-    def bn_eval(self,model):
+    def bn_eval(self, model):
         for m in model.modules():
             if isinstance(m, torch.nn.BatchNorm2d):
                 m.eval()
+
     def do_training(self):
         self.logger = Logger(self.args, update_frequency=30)
         self.results = {"val": torch.zeros(self.args.epochs), "test": torch.zeros(self.args.epochs)}
         current_high = 0
-        for self.current_epoch in range(self.args.epochs):
+        for self.current_epoch in tqdm(range(self.args.epochs)):
             self.logger.new_epoch(self.scheduler.get_lr())
             self._do_epoch(self.current_epoch)
             self.scheduler.step()
@@ -550,8 +585,8 @@ def main():
         # args.source = ['photo', 'cartoon', 'sketch']
         # args.target = ['art_painting']
         # --------------------- Single DG
-        args.source = ['sketch']
-        args.target = ['cartoon', 'photo', 'art_painting']
+        args.source = ['photo']
+        args.target = ['cartoon', 'sketch', 'art_painting']
 
     elif args.task == 'VLCS':
         args.n_classes = 5

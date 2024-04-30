@@ -80,7 +80,7 @@ def get_train_dataloader(args, patches):
             datasets.append(train_dataset)
             val_datasets.append(
                 JigsawTestNewDataset(args, name_val, labels_val, img_transformer=get_val_transformer(args),
-                                     patches=patches, jig_classes=30))
+                                     patches=patches))
     elif args.task == 'VLCS':
         for dname in dataset_list:
             name_train, name_val, labels_train, labels_val = get_split_dataset_info(
@@ -186,15 +186,27 @@ def get_multiple_val_dataloader(args, patches=False):
     loaders = []
     if args.task == 'digits':
         root = 'data/'
-        svhn = load_svhn(root, train=True)
-        mnist_m = load_mnist_m(root, train=True)
-        syn = load_syn(root, train=True)
-        usps = load_usps(root, train=True)
+        # svhn = load_svhn(root, train=True)
+        # mnist_m = load_mnist_m(root, train=True)
+        # syn = load_syn(root, train=True)
+        # usps = load_usps(root, train=True)
         svhn_t = load_svhn(root, train=False)
         mnist_m_t = load_mnist_m(root, train=False)
         syn_t = load_syn(root, train=False)
         usps_t = load_usps(root, train=False)
-        dataset = ConcatDataset([svhn, mnist_m, syn, usps, svhn_t, mnist_m_t, syn_t, usps_t])
+        dataset = ConcatDataset([svhn_t])
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
+                                             pin_memory=True, drop_last=False)
+        loaders.append(loader)
+        dataset = ConcatDataset([ mnist_m_t])
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
+                                             pin_memory=True, drop_last=False)
+        loaders.append(loader)
+        dataset = ConcatDataset([ syn_t])
+        loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
+                                             pin_memory=True, drop_last=False)
+        loaders.append(loader)
+        dataset = ConcatDataset([ usps_t])
         loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0,
                                              pin_memory=True, drop_last=False)
         loaders.append(loader)
@@ -224,7 +236,7 @@ def get_multiple_val_dataloader(args, patches=False):
         else:
             raise NotImplementedError('TEST DATA LOADER NOT IMPLEMENTED.')
         img_tr = get_val_transformer(args)
-        val_dataset = JigsawTestNewDataset(args, names, labels, patches=patches, img_transformer=img_tr, jig_classes=30)
+        val_dataset = JigsawTestNewDataset(args, names, labels, patches=patches, img_transformer=img_tr)
         if args.limit_target and len(val_dataset) > args.limit_target:
             val_dataset = Subset(val_dataset, args.limit_target)
             print("Using %d subset of val dataset" % args.limit_target)

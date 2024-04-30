@@ -247,7 +247,7 @@ class DigitsDataset(Dataset):
                 return aug_x, aug_y
             else:
                 x = self.transform(x)
-        return x, y, op
+        return x,0, y
 
 
 def get_data_loaders():
